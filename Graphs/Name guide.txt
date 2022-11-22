@@ -1,0 +1,6 @@
+output type (sigmoid, normal)	os/on
+number of hidden neurons
+run number with these settings
+batch size
+learning rate (0.1 = zp1, 0.05 = zpz5)
+training or loss curve, t, l, tl
