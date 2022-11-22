@@ -167,8 +167,8 @@ def train_one_batch(nn, dataset, special_dataset, batch_size, lr):
     return loss
 
 #test the network on a given dataset
-def test(nn, dataset, batch_size):
-    inputs, targets = generate_batch(dataset, batch_size=batch_size)
+def test(nn, dataset, special_dataset, batch_size):
+    inputs, targets = generate_batch(dataset, special_dataset, batch_size=batch_size)
     preds, H, Z = nn.forward(inputs) 
     loss = loss_mse(preds, targets)
     return loss
@@ -196,7 +196,7 @@ def cond_shannon(prob_of_neuron_given_class: list[list[float]]):
 
 import multiprocessing
 
-def shannon_worker(nn: nn_one_layer, test_data: list[float], incr: float) -> tuple[int, float, float]:
+def shannon_worker(nn: nn_one_layer, test_data: list[float], incr: float) -> tuple[float, float, dict, dict]:
     hs = dict()
     os = dict()
     for data in test_data:
@@ -227,7 +227,7 @@ def shannon_worker(nn: nn_one_layer, test_data: list[float], incr: float) -> tup
     h_tot = sum([i * log2(i) for i in hs.values()])
     o_tot = sum([i * log2(i) for i in os.values()])
 
-    return h_tot, o_tot
+    return h_tot, o_tot, os, hs
 
 def get_shannons(nn: nn_one_layer, sorted_test_data: list[list[float]], test_dat_len: int, num_of_classes: int) -> tuple[float, float]:
 
@@ -242,12 +242,31 @@ def get_shannons(nn: nn_one_layer, sorted_test_data: list[list[float]], test_dat
 
     h_tot = 0
     o_tot = 0
+    h_dicts = []
+    o_dicts = []
     for res in results:
         r = res.get(None)
         h_tot += r[0]
         o_tot += r[1]
-    return h_tot * -1.0, o_tot * -1.0
-    
+        h_dicts.append(r[2])
+        o_dicts.append(r[3])
+    return h_tot * -1.0, o_tot * -1.0, h_dicts, o_dicts
+
+def get_mutual_information(shannon: float, dict_list: list[dict[str, int]]):
+    H_X = 0
+    master_dict = dict()
+
+    for d in dict_list:
+        keys = d.keys()
+        for key in keys:
+            if key in master_dict:
+                master_dict[key] += d[key]
+            else:
+                master_dict[key] = d[key]
+
+    H_X = -1.0 * sum(i * log2(i) for i in master_dict.values())
+
+    return (H_X - shannon), H_X
 def main():
     full_train_data, full_train_labels = mnist_reader.load_mnist('data/fashion', kind='train')
     full_test_data, full_test_labels = mnist_reader.load_mnist('data/fashion', kind='t10k')
@@ -264,13 +283,18 @@ def main():
     chosen_dataset = train_data
 
     batch_size = 30 #number of examples per batch
-    nbatches = 200 #number of batches used for training
+    nbatches = 50 #number of batches used for training
     lr = 0.1 #learning rate
 
     losses = [] #training losses to record
     test_losses = []
     hidden_shannon=[]
     output_shannon=[]
+
+    mutual_hidden_promise = []
+    mutual_out_promise = []
+    mutual_hidden_pool = multiprocessing.Pool(10)
+    mutual_out_pool = multiprocessing.Pool(10)
 
     special_dataset = (np.vstack([ex[0] for ex in chosen_dataset]), np.vstack([ex[1] for ex in chosen_dataset]))
 
@@ -285,24 +309,30 @@ def main():
         losses.append(loss)
         benchmark("Ran training")
 
-        #test_loss = test(nn, test_data, batch_size)
-        #test_losses.append(test_loss)
-
-        if i % 1 == 0:
-            shan_h, shan_o = get_shannons(nn, sorted_test_data, len(test_data), len(my_kept_labels))
+        if i % 3 == 0:
+            shan_h, shan_o, h_dicts, o_dicts = get_shannons(nn, sorted_test_data, len(test_data), len(my_kept_labels))
             benchmark("Running shannons")
             hidden_shannon.append(shan_h)
             output_shannon.append(shan_o)
 
-            print(i,"  ", loss, "  ", shan_h, "  ", shan_o)
-        #shannons.append(0)
-        #print(i, "  ", loss)
+            mutual_hidden_promise.append(mutual_hidden_pool.apply_async(func=get_mutual_information, args=(shan_h, h_dicts,)))
+            mutual_out_promise.append(mutual_out_pool.apply_async(func=get_mutual_information, args=(shan_o, o_dicts,)))
 
-    fig, axs = plt.subplots(3)
+            print(i,"  ", loss, "  ", shan_h, "  ", shan_o)
+
+
+    mutual_hidden = [i.get()[0] for i in mutual_hidden_promise]
+    mutual_hidden_pool.close()
+    mutual_out = [i.get()[0] for i in mutual_out_promise]
+    mutual_out_pool.close()
+
+    fig, axs = plt.subplots(5)
     fig.suptitle('Vertically stacked subplots')
     axs[0].plot(np.arange(1, nbatches+1), losses)
     axs[1].plot(np.arange(1, len(hidden_shannon)+1), hidden_shannon)
     axs[2].plot(np.arange(1, len(output_shannon)+1), output_shannon)
+    axs[3].plot(np.arange(1, len(mutual_hidden)+1), mutual_hidden)
+    axs[4].plot(np.arange(1, len(mutual_out)+1), mutual_out)
     plt.show()
 
     name = 'nem.txt'
