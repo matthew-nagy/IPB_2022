@@ -11,6 +11,9 @@ my_kept_labels = [0, 1, 3, 8, 9]
 from math import log2
 
 import time
+import multiprocessing
+
+import info_theory as it
 duration = time.perf_counter()
 
 def get_duration():
@@ -25,7 +28,7 @@ def benchmark(place):
     global benchmarking
     if benchmarking:
         print(">" + place + ": ", get_duration())
-
+        
 import utils.mnist_reader as mnist_reader
 
 def get_simplified_data(data: list, labels: list, accepted_labels: list):
@@ -77,7 +80,7 @@ class nn_one_layer():
         self.f = sigmoid
     
     #for matrix multiplication use np.matmul()
-    def forward(self, u: list):
+    def forward(self, u: list) -> tuple[list[float], list[float], list[float]]:
         z = np.matmul(u, self.W1)
         h = self.f(z)
         v = self.f(np.matmul(h, self.W2))
@@ -173,100 +176,6 @@ def test(nn, dataset, special_dataset, batch_size):
     loss = loss_mse(preds, targets)
     return loss
 
-
-def shannon(prob_x):
-    return -1.0 * [i * log2(i) for i in prob_x]
-
-def bound_activations(x):
-    avg = sum(x) / float(len(x))
-    x[x >= avg] = 1.0
-    x[x < avg] = 0.0
-    return x
-
-#A 2d list
-#Index 1 is class label
-#Index 2 is neuron index
-def cond_shannon(prob_of_neuron_given_class: list[list[float]]):
-    tot = 0.0
-    
-    for values in prob_of_neuron_given_class:
-        for val in values:
-            tot += val * log2(val)
-    return tot * -1.0
-
-import multiprocessing
-
-def shannon_worker(nn: nn_one_layer, test_data: list[float], incr: float) -> tuple[float, float, dict, dict]:
-    hs = dict()
-    os = dict()
-    for data in test_data:
-        output, hidden, _ = nn.forward(data)
-
-        hidden = bound_activations(hidden)
-        max_out = max(output)
-        for i in range(len(output)):
-            if output[i] == max_out:
-                output[i] = 1.0
-            else:
-                output[i] = 0.0
-        
-
-        hid_str = str(hidden)
-        out_str = str(output)
-
-        if hid_str in hs:
-            hs[hid_str] += incr
-        else:
-            hs[hid_str] = incr
-        
-        if out_str in os:
-            os[out_str] += incr
-        else:
-            os[out_str] = incr
-    
-    h_tot = sum([i * log2(i) for i in hs.values()])
-    o_tot = sum([i * log2(i) for i in os.values()])
-
-    return h_tot, o_tot, os, hs
-
-def get_shannons(nn: nn_one_layer, sorted_test_data: list[list[float]], test_dat_len: int, num_of_classes: int) -> tuple[float, float]:
-
-    incr = 1.0 / float(test_dat_len)
-    pool = multiprocessing.Pool(5)
-    results = []
-
-    for data in sorted_test_data:
-        results.append(pool.apply_async(func=shannon_worker, args=(nn, data, incr, )))
-    pool.close()
-    pool.join()
-
-    h_tot = 0
-    o_tot = 0
-    h_dicts = []
-    o_dicts = []
-    for res in results:
-        r = res.get(None)
-        h_tot += r[0]
-        o_tot += r[1]
-        h_dicts.append(r[2])
-        o_dicts.append(r[3])
-    return h_tot * -1.0, o_tot * -1.0, h_dicts, o_dicts
-
-def get_mutual_information(shannon: float, dict_list: list[dict[str, int]]):
-    H_X = 0
-    master_dict = dict()
-
-    for d in dict_list:
-        keys = d.keys()
-        for key in keys:
-            if key in master_dict:
-                master_dict[key] += d[key]
-            else:
-                master_dict[key] = d[key]
-
-    H_X = -1.0 * sum(i * log2(i) for i in master_dict.values())
-
-    return (H_X - shannon), H_X
 def main():
     full_train_data, full_train_labels = mnist_reader.load_mnist('data/fashion', kind='train')
     full_test_data, full_test_labels = mnist_reader.load_mnist('data/fashion', kind='t10k')
@@ -283,56 +192,57 @@ def main():
     chosen_dataset = train_data
 
     batch_size = 30 #number of examples per batch
-    nbatches = 50 #number of batches used for training
+    nbatches = 100 #number of batches used for training
     lr = 0.1 #learning rate
 
     losses = [] #training losses to record
-    test_losses = []
-    hidden_shannon=[]
-    output_shannon=[]
+    test_accuracy = []
 
-    mutual_hidden_promise = []
-    mutual_out_promise = []
-    mutual_hidden_pool = multiprocessing.Pool(10)
-    mutual_out_pool = multiprocessing.Pool(10)
+    special_dataset_train = (np.vstack([ex[0] for ex in chosen_dataset]), np.vstack([ex[1] for ex in chosen_dataset]))
 
-    special_dataset = (np.vstack([ex[0] for ex in chosen_dataset]), np.vstack([ex[1] for ex in chosen_dataset]))
-
-    sorted_test_data = [[] for i in range(len(my_kept_labels))]
-    for (dat, one_hot, label) in test_data:
-        sorted_test_data[label].append(dat)
+    bound_outputs: list[list[tuple[int, str]]] = []    
+    bound_hidden: list[list[tuple[int, str]]] = []    
 
     benchmark("Time to start")
     for i in range(nbatches):
         get_duration()
-        loss = train_one_batch(nn, chosen_dataset, special_dataset, batch_size=batch_size, lr=lr)
+        loss = train_one_batch(nn, chosen_dataset, special_dataset_train, batch_size=batch_size, lr=lr)
         losses.append(loss)
+
+        correct = 0
+        c_o: list[tuple[int, str]] = []
+        c_h: list[tuple[int, str]] = []
+        for t in test_data:
+            raw_output, raw_hidden, _ = nn.forward(t[0])
+            avg_hidden = sum(raw_hidden) / len(raw_hidden)
+            c_h.append((t[2], str([it.bind_float(x, avg_hidden) for x in raw_hidden])))
+            c_o.append((t[2], str([float(int(x * 10.0))/10.0 for x in raw_output])))
+            if raw_output.tolist().index(max(raw_output)) == t[2]:
+                correct += 1
+        ta = correct / len(test_data) * 100.0
+        test_accuracy.append(ta)
+
+        bound_hidden.append(c_h)
+        bound_outputs.append(c_o)
+        
         benchmark("Ran training")
 
-        if i % 3 == 0:
-            shan_h, shan_o, h_dicts, o_dicts = get_shannons(nn, sorted_test_data, len(test_data), len(my_kept_labels))
-            benchmark("Running shannons")
-            hidden_shannon.append(shan_h)
-            output_shannon.append(shan_o)
+        print(i, "  ", loss, "  ", ta)
 
-            mutual_hidden_promise.append(mutual_hidden_pool.apply_async(func=get_mutual_information, args=(shan_h, h_dicts,)))
-            mutual_out_promise.append(mutual_out_pool.apply_async(func=get_mutual_information, args=(shan_o, o_dicts,)))
+    
+    
+    cond_hidden, mutual_hidden = it.compute_cond_mut("Hidden", bound_hidden, test_data)
+    cond_output, mutual_output = it.compute_cond_mut("Output", bound_outputs, test_data)
 
-            print(i,"  ", loss, "  ", shan_h, "  ", shan_o)
-
-
-    mutual_hidden = [i.get()[0] for i in mutual_hidden_promise]
-    mutual_hidden_pool.close()
-    mutual_out = [i.get()[0] for i in mutual_out_promise]
-    mutual_out_pool.close()
-
-    fig, axs = plt.subplots(5)
+        
+    fig, axs = plt.subplots(3)
     fig.suptitle('Vertically stacked subplots')
     axs[0].plot(np.arange(1, nbatches+1), losses)
-    axs[1].plot(np.arange(1, len(hidden_shannon)+1), hidden_shannon)
-    axs[2].plot(np.arange(1, len(output_shannon)+1), output_shannon)
-    axs[3].plot(np.arange(1, len(mutual_hidden)+1), mutual_hidden)
-    axs[4].plot(np.arange(1, len(mutual_out)+1), mutual_out)
+    axs[0].plot(np.arange(1, nbatches+1), test_accuracy)
+    axs[1].plot(np.arange(1, nbatches+1), cond_hidden)
+    axs[1].plot(np.arange(1, nbatches+1), mutual_hidden)
+    axs[2].plot(np.arange(1, nbatches+1), cond_output)
+    axs[2].plot(np.arange(1, nbatches+1), mutual_output)
     plt.show()
 
     name = 'nem.txt'
